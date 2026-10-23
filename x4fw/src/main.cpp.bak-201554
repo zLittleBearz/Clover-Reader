@@ -1,0 +1,337 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Update.h>
+#include <Adafruit_GFX.h>
+#include "icons.h"
+
+#define VERSION "v0.2 " __DATE__ " " __TIME__
+#define EPD_SCK 8
+#define EPD_MISO 7
+#define EPD_MOSI 10
+#define EPD_CS 21
+#define EPD_DC 4
+#define EPD_RST 5
+#define EPD_BUSY 6
+#define SD_CS 12
+#define BTN_PWR 3
+#define ROTATION 3   // ถ้าจอกลับหัว เปลี่ยนเป็น 1
+#define PW 800
+#define PH 480
+
+// ---- refresh / UI tuning ----
+#define FULL_EVERY 10        // partial กี่ครั้งแล้วค่อยล้างจอเต็ม (กันภาพซ้อน)
+#define PARTIAL_CTRL2 0xFC   // SSD1677 fast/partial LUT (ถ้าภาพเพี้ยน ดูหมายเหตุ)
+#define HILITE_50 0          // 0 = เทาอ่อน (25%), 1 = เทากลาง (50%)
+
+#include <string.h>
+
+enum Btn { NONE = -1, BACK, CONFIRM, LEFT, RIGHT, UP, DOWN, POWER };
+static GFXcanvas1 *cv;
+static SPISettings epdSpi(20000000, MSBFIRST, SPI_MODE0);
+static int lastA1 = 0, lastA2 = 0;
+static uint8_t prevBuf[PW * PH / 8];   // เฟรมก่อนหน้า (ใช้ทำ partial refresh)
+static int partialCount = 0;
+static bool firstDraw = true;
+
+// ---------- EPD (SSD1677) ----------
+static void waitBusy() {
+  uint32_t t = millis();
+  while (digitalRead(EPD_BUSY) == HIGH && millis() - t < 15000) delay(5);
+}
+static void cmd(uint8_t c) {
+  SPI.beginTransaction(epdSpi);
+  digitalWrite(EPD_DC, LOW); digitalWrite(EPD_CS, LOW);
+  SPI.transfer(c);
+  digitalWrite(EPD_CS, HIGH); SPI.endTransaction();
+}
+static void dat(uint8_t d) {
+  SPI.beginTransaction(epdSpi);
+  digitalWrite(EPD_DC, HIGH); digitalWrite(EPD_CS, LOW);
+  SPI.transfer(d);
+  digitalWrite(EPD_CS, HIGH); SPI.endTransaction();
+}
+static void sendRam(uint8_t c, const uint8_t *b) {
+  cmd(0x4E); dat(0); dat(0);
+  cmd(0x4F); dat(0); dat(0);
+  cmd(c);
+  uint8_t tmp[100];
+  SPI.beginTransaction(epdSpi);
+  digitalWrite(EPD_DC, HIGH); digitalWrite(EPD_CS, LOW);
+  for (int r = 0; r < PH; r++) {
+    for (int i = 0; i < 100; i++) tmp[i] = ~b[r * 100 + i];
+    SPI.writeBytes(tmp, 100);
+  }
+  digitalWrite(EPD_CS, HIGH); SPI.endTransaction();
+}
+static void epdInit() {
+  digitalWrite(EPD_RST, LOW); delay(20);
+  digitalWrite(EPD_RST, HIGH); delay(20);
+  waitBusy();
+  cmd(0x12); delay(10); waitBusy();
+  cmd(0x18); dat(0x80);
+  cmd(0x0C); dat(0xAE); dat(0xC7); dat(0xC3); dat(0xC0); dat(0x80);
+  cmd(0x01); dat((PH - 1) & 0xFF); dat((PH - 1) >> 8); dat(0x02);
+  cmd(0x3C); dat(0x01);
+  cmd(0x11); dat(0x03);
+  cmd(0x44); dat(0); dat(0); dat((PW - 1) & 0xFF); dat((PW - 1) >> 8);
+  cmd(0x45); dat(0); dat(0); dat((PH - 1) & 0xFF); dat((PH - 1) >> 8);
+}
+// แสดงผลจาก canvas: partial (ไม่กระพริบ) เป็นหลัก, full ทุก FULL_EVERY ครั้ง
+static void present(bool forceFull = false) {
+  bool full = forceFull || firstDraw || partialCount >= FULL_EVERY;
+  const uint8_t *b = cv->getBuffer();
+  epdInit();
+  if (full) {
+    sendRam(0x24, b);
+    sendRam(0x26, b);
+    cmd(0x22); dat(0xF7);
+    cmd(0x20); waitBusy();
+    partialCount = 0;
+    firstDraw = false;
+  } else {
+    sendRam(0x24, b);          // ภาพใหม่
+    sendRam(0x26, prevBuf);    // ภาพเก่า
+    cmd(0x22); dat(PARTIAL_CTRL2);
+    cmd(0x20); waitBusy();
+    cmd(0x22); dat(0x03);      // ปิด analog/clock หลัง partial
+    cmd(0x20); waitBusy();
+    partialCount++;
+  }
+  memcpy(prevBuf, b, sizeof(prevBuf));
+  cmd(0x10); dat(0x01);  // deep sleep
+}
+
+// ---------- Buttons ----------
+static int readBtn() {
+  if (digitalRead(BTN_PWR) == LOW) return POWER;
+  lastA1 = analogRead(1);
+  lastA2 = analogRead(2);
+  if (lastA1 < 3800) {
+    if (lastA1 >= 3100) return BACK;
+    if (lastA1 >= 2090) return CONFIRM;
+    if (lastA1 >= 750) return LEFT;
+    return RIGHT;
+  }
+  if (lastA2 < 3800) return lastA2 >= 1120 ? UP : DOWN;
+  return NONE;
+}
+static int waitBtn() {
+  int b;
+  while ((b = readBtn()) == NONE) delay(10);
+  delay(40);
+  if (readBtn() != b) return waitBtn();
+  while (readBtn() != NONE) delay(10);
+  return b;
+}
+
+// ---------- UI helpers ----------
+static void header(const char *t) {
+  cv->fillScreen(0);
+  cv->setTextColor(1);
+  cv->setTextSize(4);
+  cv->setCursor(16, 28);
+  cv->print(t);
+  cv->fillRect(0, 90, 480, 4, 1);
+}
+static void footer(const char *t) {
+  cv->setTextSize(2); cv->setTextColor(1);
+  cv->setCursor(16, 765); cv->print(t);
+}
+static void msg(const char *title, const String &a, const String &b = "") {
+  header(title);
+  cv->setTextSize(3);
+  cv->setCursor(16, 130); cv->print(a);
+  cv->setCursor(16, 230); cv->print(b);
+  footer("Press any button");
+  present();
+  waitBtn();
+}
+static int menu(const char *title, String *items, int n, int ts, const char *foot) {
+  const int ROWS = 6, RH = 100, Y0 = 110;
+  int sel = 0;
+  while (true) {
+    header(title);
+    int first = sel - sel % ROWS;
+    for (int i = 0; i < ROWS && first + i < n; i++) {
+      int y = Y0 + i * RH;
+      bool s = (first + i == sel);
+      if (s) cv->fillRect(0, y, 480, RH - 12, 1);
+      cv->setTextColor(s ? 0 : 1);
+      cv->setTextSize(ts);
+      cv->setCursor(16, y + (RH - 12 - 8 * ts) / 2);
+      String t = items[first + i];
+      int maxc = 448 / (6 * ts);
+      if ((int)t.length() > maxc) t = t.substring(0, maxc);
+      cv->print(t);
+    }
+    footer(foot);
+    present();
+    int b = waitBtn();
+    if ((b == UP || b == LEFT) && sel > 0) sel--;
+    else if ((b == DOWN || b == RIGHT) && sel < n - 1) sel++;
+    else if (b == CONFIRM || b == POWER) return sel;
+    else if (b == BACK) return -1;
+  }
+}
+
+// ---------- Home: แถบไอคอน 4 ตัวด้านล่าง ----------
+#define N_ICONS 4
+#define CELL_W 120
+#define TILE 96
+#define TILE_Y 668
+static const uint8_t *const ICONS[N_ICONS] = {ICON_LIBRARY, ICON_SETTING, ICON_APPS, ICON_UPDATE};
+static const char *const LABELS[N_ICONS] = {"Library", "Setting", "Apps", "Update"};
+
+// ไฮไลท์สีเทา = ลายจุด (dither) ทำงานกับ partial refresh ได้เร็วและไม่กระพริบ
+static void grayTile(int x, int y, int w, int h, int r) {
+  for (int j = 0; j < h; j++) {
+    for (int i = 0; i < w; i++) {
+      int cx = i < r ? r - i : (i >= w - r ? i - (w - r - 1) : 0);
+      int cy = j < r ? r - j : (j >= h - r ? j - (h - r - 1) : 0);
+      if (cx * cx + cy * cy > r * r) continue;
+      int px = x + i, py = y + j;
+#if HILITE_50
+      if (((px + py) & 1) == 0) cv->drawPixel(px, py, 1);
+#else
+      if ((px & 1) == 0 && (py & 1) == 0) cv->drawPixel(px, py, 1);
+#endif
+    }
+  }
+}
+static void drawHome(int sel) {
+  cv->fillScreen(0);
+  cv->setTextColor(1);
+  cv->setTextSize(4);
+  cv->setCursor(24, 40);
+  cv->print("X4 Reader");
+  cv->fillRect(0, 100, 480, 4, 1);
+  cv->setTextSize(1);
+  cv->setCursor(24, 114);
+  cv->print(VERSION);
+  for (int i = 0; i < N_ICONS; i++) {
+    int tx = i * CELL_W + (CELL_W - TILE) / 2;
+    if (i == sel) grayTile(tx, TILE_Y, TILE, TILE, 14);
+    cv->drawBitmap(tx + (TILE - 64) / 2, TILE_Y + (TILE - 64) / 2, ICONS[i], 64, 64, 1);
+    cv->setTextSize(2);
+    cv->setTextColor(1);
+    int len = strlen(LABELS[i]);
+    cv->setCursor(i * CELL_W + (CELL_W - len * 12) / 2, TILE_Y + TILE + 8);
+    cv->print(LABELS[i]);
+  }
+}
+
+// ---------- Firmware update from SD ----------
+static int listBins(String *out, int maxn) {
+  int n = 0;
+  File root = SD.open("/");
+  if (!root) return -1;
+  while (n < maxn) {
+    File e = root.openNextFile();
+    if (!e) break;
+    String nm = e.name();
+    bool dir = e.isDirectory();
+    e.close();
+    String l = nm; l.toLowerCase();
+    if (!dir && l.endsWith(".bin") && !nm.startsWith(".")) out[n++] = nm;
+  }
+  root.close();
+  return n;
+}
+static bool flashFile(const String &path, String &err) {
+  File f = SD.open(path.c_str(), FILE_READ);
+  if (!f) { err = "Cannot open file"; return false; }
+  size_t sz = f.size();
+  if (sz < 64 * 1024) { err = "File too small"; f.close(); return false; }
+  int m = f.read(); f.seek(0);
+  if (m != 0xE9) { err = "Not an app .bin"; f.close(); return false; }
+  if (!Update.begin(sz)) { err = "No OTA slot"; f.close(); return false; }
+  size_t w = Update.writeStream(f);
+  f.close();
+  if (w != sz) { Update.abort(); err = "Write failed"; return false; }
+  if (!Update.end(true)) { err = "Verify failed"; return false; }
+  return true;
+}
+static void updateMenu() {
+  SD.end();
+  if (!SD.begin(SD_CS, SPI, 20000000)) { msg("Update", "SD card error"); return; }
+  static String files[16];
+  int n = listBins(files, 16);
+  if (n <= 0) { msg("Update", "No .bin on SD", "(put in root)"); return; }
+  int s = menu("Pick .bin", files, n, 3, "OK=flash  BACK=cancel");
+  if (s < 0) return;
+  String path = "/" + files[s];
+  header("Flashing...");
+  cv->setTextSize(3);
+  cv->setCursor(16, 130); cv->print("Do NOT power off");
+  present();
+  String err;
+  if (!flashFile(path, err)) { msg("Failed", err); return; }
+  SD.rename(path.c_str(), (path + ".done").c_str());
+  header("Done");
+  cv->setTextSize(3);
+  cv->setCursor(16, 130); cv->print("Restarting...");
+  present(true);
+  ESP.restart();
+}
+
+// แสดงค่าปุ่มที่ "เพิ่งกด" (อ่านตอนกดค้าง ไม่ใช่ตอนปล่อย)
+static void buttonTest() {
+  const char *names[] = {"BACK", "CONFIRM", "LEFT", "RIGHT", "UP", "DOWN", "POWER"};
+  int b = NONE, a1 = 0, a2 = 0;
+  while (true) {
+    header("Button test");
+    cv->setTextSize(3);
+    cv->setCursor(16, 130); cv->print(b < 0 ? "-" : names[b]);
+    cv->setCursor(16, 230); cv->print("ADC1: "); cv->print(a1);
+    cv->setCursor(16, 280); cv->print("ADC2: "); cv->print(a2);
+    footer("POWER = exit");
+    present();
+    while ((b = readBtn()) == NONE) delay(10);
+    a1 = lastA1; a2 = lastA2;
+    while (readBtn() != NONE) delay(10);
+    delay(40);
+    if (b == POWER) return;
+  }
+}
+static void appsMenu() {
+  String items[1] = {"Button test"};
+  int s = menu("Apps", items, 1, 3, "OK=open  BACK=home");
+  if (s == 0) buttonTest();
+}
+
+static void openIcon(int i) {
+  if (i == 0) msg("Library", "Coming soon");
+  else if (i == 1) msg("Setting", "Coming soon");
+  else if (i == 2) appsMenu();
+  else if (i == 3) updateMenu();
+}
+static void home() {
+  int sel = 0;
+  while (true) {
+    drawHome(sel);
+    present();
+    int b = waitBtn();
+    if (b == LEFT || b == UP) sel = (sel + N_ICONS - 1) % N_ICONS;
+    else if (b == RIGHT || b == DOWN) sel = (sel + 1) % N_ICONS;
+    else if (b == CONFIRM || b == POWER) openIcon(sel);
+  }
+}
+
+void setup() {
+  pinMode(EPD_CS, OUTPUT); digitalWrite(EPD_CS, HIGH);
+  pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
+  pinMode(EPD_DC, OUTPUT);
+  pinMode(EPD_RST, OUTPUT); digitalWrite(EPD_RST, HIGH);
+  pinMode(EPD_BUSY, INPUT);
+  pinMode(BTN_PWR, INPUT);
+  SPI.begin(EPD_SCK, EPD_MISO, EPD_MOSI, -1);
+  cv = new GFXcanvas1(PW, PH);
+  cv->setRotation(ROTATION);
+  uint32_t t = millis();
+  while (readBtn() != NONE && millis() - t < 3000) delay(10);
+}
+
+void loop() {
+  home();
+}

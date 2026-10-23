@@ -1,0 +1,240 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Update.h>
+#include <Adafruit_GFX.h>
+
+#define VERSION "v0.1 " __DATE__ " " __TIME__
+#define EPD_SCK 8
+#define EPD_MISO 7
+#define EPD_MOSI 10
+#define EPD_CS 21
+#define EPD_DC 4
+#define EPD_RST 5
+#define EPD_BUSY 6
+#define SD_CS 12
+#define BTN_PWR 3
+#define ROTATION 1   // ถ้าจอกลับหัว เปลี่ยนเป็น 3
+#define PW 800
+#define PH 480
+
+enum Btn { NONE = -1, BACK, CONFIRM, LEFT, RIGHT, UP, DOWN, POWER };
+static GFXcanvas1 *cv;
+static SPISettings epdSpi(20000000, MSBFIRST, SPI_MODE0);
+static int lastA1 = 0, lastA2 = 0;
+
+// ---------- EPD (SSD1677) ----------
+static void waitBusy() {
+  uint32_t t = millis();
+  while (digitalRead(EPD_BUSY) == HIGH && millis() - t < 15000) delay(5);
+}
+static void cmd(uint8_t c) {
+  SPI.beginTransaction(epdSpi);
+  digitalWrite(EPD_DC, LOW); digitalWrite(EPD_CS, LOW);
+  SPI.transfer(c);
+  digitalWrite(EPD_CS, HIGH); SPI.endTransaction();
+}
+static void dat(uint8_t d) {
+  SPI.beginTransaction(epdSpi);
+  digitalWrite(EPD_DC, HIGH); digitalWrite(EPD_CS, LOW);
+  SPI.transfer(d);
+  digitalWrite(EPD_CS, HIGH); SPI.endTransaction();
+}
+static void sendRam(uint8_t c) {
+  cmd(0x4E); dat(0); dat(0);
+  cmd(0x4F); dat(0); dat(0);
+  cmd(c);
+  uint8_t tmp[100];
+  const uint8_t *b = cv->getBuffer();
+  SPI.beginTransaction(epdSpi);
+  digitalWrite(EPD_DC, HIGH); digitalWrite(EPD_CS, LOW);
+  for (int r = 0; r < PH; r++) {
+    for (int i = 0; i < 100; i++) tmp[i] = ~b[r * 100 + i];
+    SPI.writeBytes(tmp, 100);
+  }
+  digitalWrite(EPD_CS, HIGH); SPI.endTransaction();
+}
+static void refresh() {
+  digitalWrite(EPD_RST, LOW); delay(20);
+  digitalWrite(EPD_RST, HIGH); delay(20);
+  waitBusy();
+  cmd(0x12); delay(10); waitBusy();
+  cmd(0x18); dat(0x80);
+  cmd(0x0C); dat(0xAE); dat(0xC7); dat(0xC3); dat(0xC0); dat(0x80);
+  cmd(0x01); dat((PH - 1) & 0xFF); dat((PH - 1) >> 8); dat(0x02);
+  cmd(0x3C); dat(0x01);
+  cmd(0x11); dat(0x03);
+  cmd(0x44); dat(0); dat(0); dat((PW - 1) & 0xFF); dat((PW - 1) >> 8);
+  cmd(0x45); dat(0); dat(0); dat((PH - 1) & 0xFF); dat((PH - 1) >> 8);
+  sendRam(0x24);
+  sendRam(0x26);
+  cmd(0x22); dat(0xF7);
+  cmd(0x20);
+  waitBusy();
+  cmd(0x10); dat(0x01);  // deep sleep
+}
+
+// ---------- Buttons ----------
+static int readBtn() {
+  if (digitalRead(BTN_PWR) == LOW) return POWER;
+  lastA1 = analogRead(1);
+  lastA2 = analogRead(2);
+  if (lastA1 < 3800) {
+    if (lastA1 >= 3100) return BACK;
+    if (lastA1 >= 2090) return CONFIRM;
+    if (lastA1 >= 750) return LEFT;
+    return RIGHT;
+  }
+  if (lastA2 < 3800) return lastA2 >= 1120 ? UP : DOWN;
+  return NONE;
+}
+static int waitBtn() {
+  int b;
+  while ((b = readBtn()) == NONE) delay(10);
+  delay(40);
+  if (readBtn() != b) return waitBtn();
+  while (readBtn() != NONE) delay(10);
+  return b;
+}
+
+// ---------- UI ----------
+static void header(const char *t) {
+  cv->fillScreen(0);
+  cv->setTextColor(1);
+  cv->setTextSize(4);
+  cv->setCursor(16, 28);
+  cv->print(t);
+  cv->fillRect(0, 90, 480, 4, 1);
+}
+static void footer(const char *t) {
+  cv->setTextSize(2); cv->setTextColor(1);
+  cv->setCursor(16, 765); cv->print(t);
+}
+static void msg(const char *title, const String &a, const String &b = "") {
+  header(title);
+  cv->setTextSize(3);
+  cv->setCursor(16, 130); cv->print(a);
+  cv->setCursor(16, 230); cv->print(b);
+  footer("Press any button");
+  refresh();
+  waitBtn();
+}
+static int menu(const char *title, String *items, int n, int ts, const char *foot) {
+  const int ROWS = 6, RH = 100, Y0 = 110;
+  int sel = 0;
+  while (true) {
+    header(title);
+    int first = sel - sel % ROWS;
+    for (int i = 0; i < ROWS && first + i < n; i++) {
+      int y = Y0 + i * RH;
+      bool s = (first + i == sel);
+      if (s) cv->fillRect(0, y, 480, RH - 12, 1);
+      cv->setTextColor(s ? 0 : 1);
+      cv->setTextSize(ts);
+      cv->setCursor(16, y + (RH - 12 - 8 * ts) / 2);
+      String t = items[first + i];
+      int maxc = 448 / (6 * ts);
+      if ((int)t.length() > maxc) t = t.substring(0, maxc);
+      cv->print(t);
+    }
+    footer(foot);
+    refresh();
+    int b = waitBtn();
+    if ((b == UP || b == LEFT) && sel > 0) sel--;
+    else if ((b == DOWN || b == RIGHT) && sel < n - 1) sel++;
+    else if (b == CONFIRM || b == POWER) return sel;
+    else if (b == BACK) return -1;
+  }
+}
+
+// ---------- Firmware update from SD ----------
+static int listBins(String *out, int maxn) {
+  int n = 0;
+  File root = SD.open("/");
+  if (!root) return -1;
+  while (n < maxn) {
+    File e = root.openNextFile();
+    if (!e) break;
+    String nm = e.name();
+    bool dir = e.isDirectory();
+    e.close();
+    String l = nm; l.toLowerCase();
+    if (!dir && l.endsWith(".bin") && !nm.startsWith(".")) out[n++] = nm;
+  }
+  root.close();
+  return n;
+}
+static bool flashFile(const String &path, String &err) {
+  File f = SD.open(path.c_str(), FILE_READ);
+  if (!f) { err = "Cannot open file"; return false; }
+  size_t sz = f.size();
+  if (sz < 64 * 1024) { err = "File too small"; f.close(); return false; }
+  int m = f.read(); f.seek(0);
+  if (m != 0xE9) { err = "Not an app .bin"; f.close(); return false; }
+  if (!Update.begin(sz)) { err = "No OTA slot"; f.close(); return false; }
+  size_t w = Update.writeStream(f);
+  f.close();
+  if (w != sz) { Update.abort(); err = "Write failed"; return false; }
+  if (!Update.end(true)) { err = "Verify failed"; return false; }
+  return true;
+}
+static void updateMenu() {
+  SD.end();
+  if (!SD.begin(SD_CS, SPI, 20000000)) { msg("Update", "SD card error"); return; }
+  static String files[16];
+  int n = listBins(files, 16);
+  if (n <= 0) { msg("Update", "No .bin on SD", "(put in root)"); return; }
+  int s = menu("Pick .bin", files, n, 3, "OK=flash  BACK=cancel");
+  if (s < 0) return;
+  String path = "/" + files[s];
+  header("Flashing...");
+  cv->setTextSize(3);
+  cv->setCursor(16, 130); cv->print("Do NOT power off");
+  refresh();
+  String err;
+  if (!flashFile(path, err)) { msg("Failed", err); return; }
+  SD.rename(path.c_str(), (path + ".done").c_str());
+  header("Done");
+  cv->setTextSize(3);
+  cv->setCursor(16, 130); cv->print("Restarting...");
+  refresh();
+  ESP.restart();
+}
+
+static void buttonTest() {
+  while (true) {
+    int b = readBtn();
+    const char *names[] = {"BACK", "CONFIRM", "LEFT", "RIGHT", "UP", "DOWN", "POWER"};
+    header("Button test");
+    cv->setTextSize(3);
+    cv->setCursor(16, 130); cv->print(b < 0 ? "-" : names[b]);
+    cv->setCursor(16, 230); cv->print("ADC1: "); cv->print(lastA1);
+    cv->setCursor(16, 280); cv->print("ADC2: "); cv->print(lastA2);
+    footer("POWER = exit");
+    refresh();
+    int p = waitBtn();
+    if (p == POWER) return;
+  }
+}
+
+void setup() {
+  pinMode(EPD_CS, OUTPUT); digitalWrite(EPD_CS, HIGH);
+  pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
+  pinMode(EPD_DC, OUTPUT);
+  pinMode(EPD_RST, OUTPUT); digitalWrite(EPD_RST, HIGH);
+  pinMode(EPD_BUSY, INPUT);
+  pinMode(BTN_PWR, INPUT);
+  SPI.begin(EPD_SCK, EPD_MISO, EPD_MOSI, -1);
+  cv = new GFXcanvas1(PW, PH);
+  cv->setRotation(ROTATION);
+  uint32_t t = millis();
+  while (readBtn() != NONE && millis() - t < 3000) delay(10);
+}
+
+void loop() {
+  String items[3] = {"Read books", "Update firmware", "Button test"};
+  int s = menu("X4 Reader", items, 3, 4, VERSION);
+  if (s == 0) msg("Books", "Coming soon");
+  else if (s == 1) updateMenu();
+  else if (s == 2) buttonTest();
+}
