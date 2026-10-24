@@ -2,10 +2,23 @@
 #include <SPI.h>
 #include <SD.h>
 #include <Update.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#ifdef SET_LOOP_TASK_STACK_SIZE
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);   // เพิ่มสแตกของ loop (กันสแตกล้น)
+#endif
+static RTC_NOINIT_ATTR char dbgStep[24];       // เก็บ "ขั้นตอนล่าสุด" ไว้ดูหลังรีบูตผิดปกติ
+static RTC_NOINIT_ATTR uint32_t dbgMagic;
+static char rstInfo[120] = "";
+#define DBG(s) do { strlcpy(dbgStep, (s), sizeof(dbgStep)); dbgMagic = 0xC10E; } while (0)
+#define REFRESH_HOLD_MS 1200
 #include <Adafruit_GFX.h>
 #include "icons.h"
 
-#define VERSION "v0.3 " __DATE__ " " __TIME__
+#define VERSION "v0.6d " __DATE__ " " __TIME__
 #define EPD_SCK 8
 #define EPD_MISO 7
 #define EPD_MOSI 10
@@ -33,6 +46,7 @@
 
 enum Btn { NONE = -1, BACK, CONFIRM, LEFT, RIGHT, UP, DOWN, POWER };
 static GFXcanvas1 *cv;
+#include "thai.h"   // ข้อความไทย/ละติน (ฟอนต์จาก tools/gen_thai.py)
 static SPISettings epdSpi(20000000, MSBFIRST, SPI_MODE0);
 static int lastA1 = 0, lastA2 = 0;
 static uint8_t prevBuf[PW * PH / 8];   // เฟรมก่อนหน้า (ใช้ทำ partial refresh)
@@ -40,9 +54,10 @@ static int partialCount = 0;
 static bool firstDraw = true;
 
 // ---------- EPD (SSD1677) ----------
+static void pollDuring();   // นิยามไว้ข้างล่าง
 static void waitBusy() {
   uint32_t t = millis();
-  while (digitalRead(EPD_BUSY) == HIGH && millis() - t < 15000) delay(5);
+  while (digitalRead(EPD_BUSY) == HIGH && millis() - t < 15000) { pollDuring(); delay(5); }
 }
 static void cmd(uint8_t c) {
   SPI.beginTransaction(epdSpi);
@@ -88,28 +103,42 @@ static void epdInit() {
   cmd(0x45); dat(0); dat(0); dat((PH - 1) & 0xFF); dat((PH - 1) >> 8);
 }
 // แสดงผลจาก canvas: partial (ไม่กระพริบ) เป็นหลัก, full ทุก FULL_EVERY ครั้ง
+static int fullEvery = 0;   // 0 = ปิดรีเฟรชเต็มจออัตโนมัติ (กด OK ค้างเพื่อรีเฟรชเอง)
+static bool epdOn = false;   // จอตื่นอยู่ (ยังไม่ deep sleep)
+static uint32_t lastPresentMs = 0, dbgInit = 0, dbgRam = 0, dbgRef = 0;
+static void epdPark() {
+  if (!epdOn) return;
+  cmd(0x22); dat(0x03); cmd(0x20); waitBusy();   // ปิด analog/clock
+  cmd(0x10); dat(0x01);                          // deep sleep
+  epdOn = false;
+}
 static void present(bool forceFull = false) {
-  bool full = forceFull || firstDraw || partialCount >= FULL_EVERY;
+  bool full = forceFull || firstDraw || (fullEvery > 0 && partialCount >= fullEvery);
   const uint8_t *b = cv->getBuffer();
-  epdInit();
+  uint32_t t0 = millis();
+  if (full || !epdOn) { epdInit(); epdOn = true; }
+  uint32_t t1 = millis();
   if (full) {
     sendRam(0x24, b);
     sendRam(0x26, b);
+  } else {
+    sendRam(0x24, b);
+    sendRam(0x26, prevBuf);
+  }
+  uint32_t t2 = millis();
+  if (full) {
     cmd(0x22); dat(0xF7);
     cmd(0x20); waitBusy();
     partialCount = 0;
     firstDraw = false;
   } else {
-    sendRam(0x24, b);          // ภาพใหม่
-    sendRam(0x26, prevBuf);    // ภาพเก่า
     cmd(0x22); dat(PARTIAL_CTRL2);
-    cmd(0x20); waitBusy();
-    cmd(0x22); dat(0x03);      // ปิด analog/clock หลัง partial
     cmd(0x20); waitBusy();
     partialCount++;
   }
   memcpy(prevBuf, b, sizeof(prevBuf));
-  cmd(0x10); dat(0x01);  // deep sleep
+  dbgInit = t1 - t0; dbgRam = t2 - t1; dbgRef = millis() - t2;
+  lastPresentMs = millis();
 }
 
 // ---------- Buttons ----------
@@ -129,34 +158,109 @@ static int readBtn() {
   }
   return NONE;
 }
+// ---------- Deep sleep (กด Power ค้าง) ----------
+#define SLEEP_HOLD_MS 1500
+static void armSleep() {
+  gpio_pullup_en((gpio_num_t)BTN_PWR);
+  gpio_hold_en((gpio_num_t)EPD_CS);
+  gpio_hold_en((gpio_num_t)SD_CS);
+  gpio_deep_sleep_hold_en();
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_PWR, ESP_GPIO_WAKEUP_GPIO_LOW);
+}
+static void goSleep() {
+  cv->fillScreen(0);
+  cv->setTextColor(1);
+  thDraw(24, 76, "Clover Reader", 0);
+  cv->fillRect(0, 100, 480, 4, 1);
+  thWrapDraw(24, 300, "ปิดเครื่องแล้ว", 0, 432, 2);
+  thWrapDraw(24, 420, "กดปุ่ม Power ค้างเพื่อเปิดเครื่อง", 1, 432, 2);
+  present(true);
+  epdPark();
+  while (digitalRead(BTN_PWR) == LOW) delay(10);
+  delay(100);
+  armSleep();
+  esp_deep_sleep_start();
+}
+// ---------- ปุ่ม: อ่านเป็น "สถานะ" ที่นิ่งพอ ไม่ใช้คิว ----------
+#define CATCH_DURING_REFRESH 1   // 1 = จับการกดขณะจอรีเฟรช (1 ครั้ง) ถ้าปุ่มเพี้ยนให้ตั้งเป็น 0
+#define HOLD_FIRST_MS 600
+#define HOLD_REP_MS 120
+#define BTN_UNSTABLE -2
+static int heldBtn = NONE, pendBtn = NONE;
+static bool kbBackRep = false;   // true = กด BACK ค้างแล้วลบต่อเนื่อง (ใช้ในคีย์บอร์ด)
+static uint32_t heldSince = 0, lastRep = 0;
+static int pdCand = NONE, pdCnt = 0;
+static bool isNav(int b) { return b == UP || b == DOWN || b == LEFT || b == RIGHT; }
+static int navDir(int b) { return (b == UP || b == LEFT) ? -1 : (b == DOWN || b == RIGHT) ? 1 : 0; }
+static int navSteps(int b) { return navDir(b); }
+static void qclear() { pendBtn = NONE; }
+static void idleTick() { if (epdOn && millis() - lastPresentMs > 2000) epdPark(); }
+static int stableBtn() {   // ต้องอ่านได้ค่าเดิม 4 ครั้งติด
+  int c = readBtn();
+  for (int i = 1; i < 4; i++) { delay(4); if (readBtn() != c) return BTN_UNSTABLE; }
+  return c;
+}
+static void pollDuring() {   // เรียกระหว่างรอจอรีเฟรช
+#if CATCH_DURING_REFRESH
+  int r = readBtn();
+  if (r == pdCand) { if (pdCnt < 50) pdCnt++; } else { pdCand = r; pdCnt = 1; }
+  if (pdCnt == 8) {   // นิ่งประมาณ 40 ms
+    if (pdCand == NONE) heldBtn = NONE;   // เห็นการปล่อยปุ่ม
+    else if (pdCand != heldBtn) { pendBtn = pdCand; heldBtn = pdCand; }
+  }
+#endif
+}
 static int waitBtn() {
-  int b;
-  while ((b = readBtn()) == NONE) delay(10);
-  delay(40);
-  if (readBtn() != b) return waitBtn();
-  while (readBtn() != NONE) delay(10);
-  return b;
+  while (true) {
+    int b;
+    if (pendBtn != NONE) {
+      b = pendBtn; pendBtn = NONE;
+      heldBtn = b; heldSince = lastRep = millis();
+    } else {
+      int c = stableBtn();
+      if (c == BTN_UNSTABLE) { delay(2); continue; }
+      uint32_t now = millis();
+      if (c == NONE) { heldBtn = NONE; idleTick(); delay(8); continue; }
+      if (c != heldBtn) { heldBtn = c; heldSince = lastRep = now; b = c; }
+      else if ((isNav(c) || (kbBackRep && c == BACK)) && now - heldSince > HOLD_FIRST_MS && now - lastRep > HOLD_REP_MS) { lastRep = now; b = c; }
+      else { delay(8); continue; }
+    }
+    if (b == POWER) {
+      uint32_t t0 = millis();
+      while (readBtn() == POWER) {
+        if (millis() - t0 >= SLEEP_HOLD_MS) goSleep();
+        delay(10);
+      }
+    }
+    if (b == CONFIRM) {
+      uint32_t t0 = millis();
+      bool did = false;
+      while (readBtn() == CONFIRM) {
+        if (!did && millis() - t0 >= REFRESH_HOLD_MS) { present(true); did = true; }
+        delay(10);
+      }
+      if (did) { heldBtn = NONE; continue; }   // กด OK ค้าง = รีเฟรชจอเอง (ไม่ส่ง OK)
+    }
+    return b;
+  }
 }
 
 // ---------- UI helpers ----------
 static void header(const char *t) {
   cv->fillScreen(0);
   cv->setTextColor(1);
-  cv->setTextSize(4);
-  cv->setCursor(16, 28);
-  cv->print(t);
+  thWrapDraw(16, 64, t, 0, 448, 1);
   cv->fillRect(0, 90, 480, 4, 1);
 }
 static void footer(const char *t) {
-  cv->setTextSize(2); cv->setTextColor(1);
-  cv->setCursor(16, 765); cv->print(t);
+  cv->setTextColor(1);
+  thWrapDraw(16, 782, t, 1, 340, 1);
 }
 static void msg(const char *title, const String &a, const String &b = "") {
   header(title);
-  cv->setTextSize(3);
-  cv->setCursor(16, 130); cv->print(a);
-  cv->setCursor(16, 230); cv->print(b);
-  footer("Press any button");
+  thWrapDraw(16, 170, a.c_str(), 0, 448, 2);
+  thWrapDraw(16, 290, b.c_str(), 0, 448, 2);
+  footer("กดปุ่มใดก็ได้");
   present();
   waitBtn();
 }
@@ -177,31 +281,13 @@ static void grayTile(int x, int y, int w, int h, int r) {
   }
 }
 
-// ASCII เท่านั้น (ฟอนต์ไทยจะมาในขั้นถัดไป): ตัวอักษร UTF-8 หลายไบต์ -> '?' ตัวเดียว
-static String asciiOnly(const String &in) {
-  String out;
-  for (int i = 0; i < in.length(); i++) {
-    uint8_t c = (uint8_t)in[i];
-    if (c < 0x80) out += (char)c;
-    else if (c >= 0xC0) out += '?';
-  }
-  return out;
-}
-static void printWrapped(const String &s, int x, int y, int ts, int maxLines, int maxc) {
-  int len = s.length();
-  for (int k = 0; k < maxLines && k * maxc < len; k++) {
-    int e = (k + 1) * maxc;
-    if (e > len) e = len;
-    String line = s.substring(k * maxc, e);
-    if (k == maxLines - 1 && len > (k + 1) * maxc) line = line.substring(0, maxc - 2) + "..";
-    cv->setCursor(x, y + k * (8 * ts + 4));
-    cv->print(line);
-  }
-}
+#include "kbd.h"
+
 // เมนูรายการ: ตัวใหญ่ ขึ้นได้ 2 บรรทัด ไฮไลท์เทา คืนค่า index หรือ -1 (BACK)
 static int menu(const char *title, String *items, int n, int ts, const char *foot, int sel0 = 0) {
   const int ROWS = 6, RH = 100, Y0 = 110;
-  const int maxc = 440 / (6 * ts);
+  (void)ts;
+  qclear();
   int sel = sel0 < 0 ? 0 : (sel0 >= n ? n - 1 : sel0);
   while (true) {
     header(title);
@@ -211,24 +297,27 @@ static int menu(const char *title, String *items, int n, int ts, const char *foo
       bool s = (first + i == sel);
       if (s) grayTile(8, y, 464, RH - 12, 12);
       cv->setTextColor(1);
-      cv->setTextSize(ts);
-      String t = asciiOnly(items[first + i]);
-      int lines = (int)t.length() > maxc ? 2 : 1;
-      int th = lines * 8 * ts + (lines - 1) * 4;
-      printWrapped(t, 20, y + (RH - 12 - th) / 2, ts, 2, maxc);
+      const char *t = items[first + i].c_str();
+      int lines = thWrapDraw(0, 0, t, 0, 436, 2, false);
+      int base0 = y + ((RH - 12) - (lines - 1) * thPitch(0)) / 2 + 11;
+      thWrapDraw(20, base0, t, 0, 436, 2);
     }
     footer(foot);
     char pg[16];
     snprintf(pg, sizeof(pg), "%d/%d", sel + 1, n);
-    cv->setTextSize(2);
-    cv->setCursor(480 - 16 - (int)strlen(pg) * 12, 765);
-    cv->print(pg);
+    thDraw(480 - 16 - thWidth(pg, 1), 782, pg, 1);
     present();
-    int b = waitBtn();
-    if ((b == UP || b == LEFT) && sel > 0) sel--;
-    else if ((b == DOWN || b == RIGHT) && sel < n - 1) sel++;
-    else if (b == CONFIRM || b == POWER) return sel;
-    else if (b == BACK) return -1;
+    for (;;) {
+      int b = waitBtn();
+      if (isNav(b)) {
+        int ns = sel + navSteps(b);
+        ns = ns < 0 ? 0 : (ns > n - 1 ? n - 1 : ns);
+        if (ns == sel) continue;   // อยู่ปลายรายการแล้ว ไม่ต้องรีเฟรช
+        sel = ns; break;
+      }
+      if (b == CONFIRM || b == POWER) return sel;
+      if (b == BACK) return -1;
+    }
   }
 }
 
@@ -280,27 +369,26 @@ static void fileScreen(const String &dir, const String &name) {
   char sb[24];
   if (sz >= 1024 * 1024) snprintf(sb, sizeof(sb), "%.1f MB", sz / 1048576.0);
   else snprintf(sb, sizeof(sb), "%u KB", (unsigned)((sz + 1023) / 1024));
-  header("File");
+  header("ไฟล์");
   cv->setTextColor(1);
-  cv->setTextSize(3);
-  printWrapped(asciiOnly(name), 16, 120, 3, 4, 26);
-  cv->setCursor(16, 300); cv->print(sb);
-  cv->setCursor(16, 380); cv->print("Reader: coming soon");
-  footer("Press any button");
+  thWrapDraw(16, 160, name.c_str(), 0, 448, 4);
+  thDraw(16, 350, sb, 0);
+  thDraw(16, 420, "ตัวอ่าน: เร็ว ๆ นี้", 0);
+  footer("กดปุ่มใดก็ได้");
   present();
   waitBtn();
 }
 static void library() {
   SD.end();
-  if (!SD.begin(SD_CS, SPI, 20000000)) { msg("Library", "SD card error"); return; }
+  if (!SD.begin(SD_CS, SPI, 20000000)) { msg("ห้องสมุด", "อ่าน SD การ์ดไม่ได้"); return; }
   String cwd = "/";
   int selStack[16];
   int depth = 0, sel = 0;
   while (true) {
     int n = listDir(cwd, LIB_MAX);
-    if (n < 0) { msg("Library", "Cannot read", "this folder"); return; }
+    if (n < 0) { msg("ห้องสมุด", "เปิดโฟลเดอร์นี้ไม่ได้"); return; }
     if (n == 0) {
-      msg("Library", "Empty folder");
+      msg("ห้องสมุด", "โฟลเดอร์ว่างเปล่า");
       if (depth == 0) return;
       int i = cwd.lastIndexOf('/');
       cwd = i <= 0 ? String("/") : cwd.substring(0, i);
@@ -309,16 +397,15 @@ static void library() {
     }
     sortEntries(n);
     for (int i = 0; i < n; i++) libLabels[i] = libDirs[i] ? libNames[i] + "/" : libNames[i];
-    String title = depth == 0 ? String("Library") : asciiOnly(leafOf(cwd));
-    if (title.length() > 17) title = title.substring(0, 17);
-    int s = menu(title.c_str(), libLabels, n, 4, "OK=open  BACK=up", sel);
+    String title = depth == 0 ? String("ห้องสมุด") : leafOf(cwd);
+    int s = menu(title.c_str(), libLabels, n, 4, "OK=เปิด  BACK=ย้อนกลับ", sel);
     if (s < 0) {
       if (depth == 0) return;
       int i = cwd.lastIndexOf('/');
       cwd = i <= 0 ? String("/") : cwd.substring(0, i);
       sel = selStack[--depth];
     } else if (libDirs[s]) {
-      if (depth >= 15) { msg("Library", "Too deep"); continue; }
+      if (depth >= 15) { msg("ห้องสมุด", "โฟลเดอร์ลึกเกินไป"); continue; }
       selStack[depth++] = s;
       cwd = (cwd == "/" ? String("/") : cwd + "/") + libNames[s];
       sel = 0;
@@ -335,27 +422,26 @@ static void library() {
 #define TILE 96
 #define TILE_Y 668
 static const uint8_t *const ICONS[N_ICONS] = {ICON_LIBRARY, ICON_APPS, ICON_UPDATE, ICON_SETTING};
-static const char *const LABELS[N_ICONS] = {"Library", "Apps", "Update", "Setting"};
+static const char *const LABELS[N_ICONS] = {"ห้องสมุด", "แอป", "อัปเดต", "ตั้งค่า"};
 
 static void drawHome(int sel) {
   cv->fillScreen(0);
   cv->setTextColor(1);
-  cv->setTextSize(4);
-  cv->setCursor(24, 40);
-  cv->print("X4 Reader");
+  thDraw(24, 76, "X4 Reader", 0);
   cv->fillRect(0, 100, 480, 4, 1);
   cv->setTextSize(1);
   cv->setCursor(24, 114);
   cv->print(VERSION);
+  cv->print(" i"); cv->print((unsigned)dbgInit);
+  cv->print(" r"); cv->print((unsigned)dbgRam);
+  cv->print(" d"); cv->print((unsigned)dbgRef);
+  if (rstInfo[0]) thWrapDraw(16, 160, rstInfo, 1, 448, 3);
   for (int i = 0; i < N_ICONS; i++) {
     int tx = i * CELL_W + (CELL_W - TILE) / 2;
     if (i == sel) grayTile(tx, TILE_Y, TILE, TILE, 14);
     cv->drawBitmap(tx + (TILE - 64) / 2, TILE_Y + (TILE - 64) / 2, ICONS[i], 64, 64, 1);
-    cv->setTextSize(2);
     cv->setTextColor(1);
-    int len = strlen(LABELS[i]);
-    cv->setCursor(i * CELL_W + (CELL_W - len * 12) / 2, TILE_Y + TILE + 8);
-    cv->print(LABELS[i]);
+    thDraw(i * CELL_W + (CELL_W - thWidth(LABELS[i], 1)) / 2, TILE_Y + TILE + 28, LABELS[i], 1);
   }
 }
 
@@ -392,24 +478,24 @@ static bool flashFile(const String &path, String &err) {
 }
 static void updateMenu() {
   SD.end();
-  if (!SD.begin(SD_CS, SPI, 20000000)) { msg("Update", "SD card error"); return; }
+  if (!SD.begin(SD_CS, SPI, 20000000)) { msg("อัปเดต", "อ่าน SD การ์ดไม่ได้"); return; }
   static String files[16];
   int n = listBins(files, 16);
-  if (n <= 0) { msg("Update", "No .bin on SD", "(put in root)"); return; }
-  int s = menu("Pick .bin", files, n, 3, "OK=flash  BACK=cancel");
+  if (n <= 0) { msg("อัปเดต", "ไม่พบไฟล์ .bin ใน SD", "(วางไว้นอกสุด ไม่อยู่ในโฟลเดอร์)"); return; }
+  int s = menu("เลือกไฟล์ .bin", files, n, 3, "OK=แฟลช  BACK=ยกเลิก");
   if (s < 0) return;
   String path = "/" + files[s];
-  header("Flashing...");
-  cv->setTextSize(3);
-  cv->setCursor(16, 130); cv->print("Do NOT power off");
+  header("กำลังแฟลช...");
+  thDraw(16, 170, "ห้ามปิดเครื่อง", 0);
   present();
+  epdPark();
   String err;
-  if (!flashFile(path, err)) { msg("Failed", err); return; }
+  if (!flashFile(path, err)) { msg("ล้มเหลว", err); return; }
   SD.rename(path.c_str(), (path + ".done").c_str());
-  header("Done");
-  cv->setTextSize(3);
-  cv->setCursor(16, 130); cv->print("Restarting...");
+  header("เสร็จแล้ว");
+  thDraw(16, 170, "กำลังรีสตาร์ต...", 0);
   present(true);
+  epdPark();
   ESP.restart();
 }
 
@@ -423,26 +509,57 @@ static void buttonTest() {
     cv->setCursor(16, 130); cv->print(b < 0 ? "-" : names[b]);
     cv->setCursor(16, 230); cv->print("ADC1: "); cv->print(a1);
     cv->setCursor(16, 280); cv->print("ADC2: "); cv->print(a2);
-    footer("POWER = exit");
+    footer("POWER = ออก");
     present();
-    while ((b = readBtn()) == NONE) delay(10);
+    while ((b = readBtn()) == NONE) { idleTick(); delay(10); }
     a1 = lastA1; a2 = lastA2;
     while (readBtn() != NONE) delay(10);
     delay(40);
     if (b == POWER) return;
   }
 }
+// เทียบน้ำหนักฟอนต์ (Regular / Medium / Bold) บนจอจริง: ซ้าย/ขวา = เลือก, BACK = ออก (ค่าที่เลือกใช้กับทั้ง UI จนปิดเครื่อง)
+static const char *weightName(int v) {
+  return v <= 300 ? "Light" : v <= 400 ? "Regular" : v <= 500 ? "Medium" : v <= 600 ? "SemiBold" : "Bold";
+}
+static void fontTest() {
+  int sel = thWeight;
+  while (true) {
+    header("ทดสอบฟอนต์");
+    for (int w = 0; w < TF_WEIGHTS; w++) {
+      int y0 = 110 + w * 210;
+      thWeight = w;
+      char lb[40];
+      snprintf(lb, sizeof(lb), "%s %d%s", weightName(TF_WEIGHT_VAL[w]), TF_WEIGHT_VAL[w], w == sel ? "  <" : "");
+      thWrapDraw(16, y0 + 24, lb, 1, 440, 1);
+      thWrapDraw(16, y0 + 76, "ห้องสมุด ตั้งค่า น้ำ ปู่", 0, 448, 1);
+      thWrapDraw(16, y0 + 124, "เด็กน้อยอ่านหนังสือเรื่องผู้ชายที่ปีนเขา Fourth_Wing", 1, 448, 2);
+      if (w == sel) cv->fillRect(0, y0 - 4, 6, 196, 1);
+    }
+    thWeight = sel;
+    footer("ซ้าย/ขวา=เลือก  BACK=ออก");
+    present();
+    int b = waitBtn();
+    if ((b == UP || b == LEFT) && sel > 0) sel--;
+    else if ((b == DOWN || b == RIGHT) && sel < TF_WEIGHTS - 1) sel++;
+    else if (b == BACK || b == CONFIRM || b == POWER) { thWeight = sel; return; }
+  }
+}
+#include "wifi_xfer.h"
 static void appsMenu() {
-  String items[1] = {"Button test"};
-  int s = menu("Apps", items, 1, 3, "OK=open  BACK=home");
-  if (s == 0) buttonTest();
+  String items[4] = {"รับส่งไฟล์ WiFi", "ทดสอบคีย์บอร์ด", "Button test", "ทดสอบฟอนต์"};
+  int s = menu("แอป", items, 4, 3, "OK=เปิด  BACK=กลับ");
+  if (s == 0) wifiMenu();
+  else if (s == 1) kbTest();
+  else if (s == 2) buttonTest();
+  else if (s == 3) fontTest();
 }
 
 static void openIcon(int i) {
   if (i == 0) library();
   else if (i == 1) appsMenu();
   else if (i == 2) updateMenu();
-  else if (i == 3) msg("Setting", "Coming soon");
+  else if (i == 3) settingsMenu();
 }
 static void home() {
   int sel = 0;
@@ -450,19 +567,39 @@ static void home() {
     drawHome(sel);
     present();
     int b = waitBtn();
-    if (b == LEFT || b == UP) sel = (sel + N_ICONS - 1) % N_ICONS;
-    else if (b == RIGHT || b == DOWN) sel = (sel + 1) % N_ICONS;
-    else if (b == CONFIRM || b == POWER) openIcon(sel);
+    if (isNav(b)) sel = ((sel + navSteps(b)) % N_ICONS + N_ICONS) % N_ICONS;
+    else if (b == CONFIRM || b == POWER) { openIcon(sel); qclear(); }
   }
 }
 
 void setup() {
+  gpio_deep_sleep_hold_dis();
+  gpio_hold_dis((gpio_num_t)EPD_CS);
+  gpio_hold_dis((gpio_num_t)SD_CS);
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    if (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT)
+      snprintf(rstInfo, sizeof(rstInfo), "รีบูตผิดปกติ (รหัส %d) ขั้นตอนล่าสุด: %s", (int)rr, dbgMagic == 0xC10E ? dbgStep : "?");
+    dbgMagic = 0;
+    Preferences q;
+    q.begin("ui", false);
+    fullEvery = q.getInt("fe", 0);
+    q.end();
+  }
   pinMode(EPD_CS, OUTPUT); digitalWrite(EPD_CS, HIGH);
   pinMode(SD_CS, OUTPUT); digitalWrite(SD_CS, HIGH);
   pinMode(EPD_DC, OUTPUT);
   pinMode(EPD_RST, OUTPUT); digitalWrite(EPD_RST, HIGH);
   pinMode(EPD_BUSY, INPUT);
   pinMode(BTN_PWR, INPUT);
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+    uint32_t w0 = millis();
+    while (digitalRead(BTN_PWR) == LOW && millis() - w0 < SLEEP_HOLD_MS) delay(10);
+    if (digitalRead(BTN_PWR) == HIGH) {   // กดไม่นานพอ: หลับต่อโดยไม่แตะจอ
+      armSleep();
+      esp_deep_sleep_start();
+    }
+  }
   SPI.begin(EPD_SCK, EPD_MISO, EPD_MOSI, -1);
   cv = new GFXcanvas1(PW, PH);
   cv->setRotation(ROTATION);
