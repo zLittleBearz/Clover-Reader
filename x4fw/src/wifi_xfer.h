@@ -95,12 +95,12 @@ function up(files){
     if(i>=q.length){st("อัปโหลดเสร็จ "+ok+"/"+q.length+" ไฟล์");$("pb").style.display="none";$("f").value="";ls(cur);return}
     var f=q[i++],x=new XMLHttpRequest(),fd=new FormData();
     fd.append("f",f,f.name);
-    x.open("POST","/api/up?path="+E(cur)+"&name="+E(f.name));
+    x.open("POST","/api/up?path="+E(cur)+"&name="+E(f.name)+"&size="+f.size);
     x.upload.onprogress=function(e){
       if(e.lengthComputable){var p=Math.round(e.loaded*100/e.total);
         $("pb").style.display="block";$("pb").firstChild.style.width=p+"%";
         st("("+i+"/"+q.length+") "+f.name+" "+p+"%")}};
-    x.onload=function(){if(x.status===200)ok++;next()};
+    x.onload=function(){if(x.status===200)ok++;else alert(f.name+" : "+x.responseText);next()};
     x.onerror=function(){next()};
     x.send(fd);
   }
@@ -116,6 +116,19 @@ static int xfUp = 0, xfDl = 0, xfOps = 0;
 static int xfRoot = 0, xfSta = 0;
 static String xfLastName;
 static File xfUf;
+static uint32_t xfRx = 0, xfWr = 0, xfDecl = 0;   // รับจากเครือข่าย / เขียนลง SD / ขนาดที่เบราว์เซอร์บอก
+static int xfWrErr = 0;
+static String xfUpMsg, xfUpPath;
+static char xfUpErr[120] = "";
+static uint8_t xfUb[4096];
+static int xfUbN = 0;
+static void xfUbFlush() {   // เขียน SD ทีละ 4 KB (เร็วและเรียกน้อยกว่าเดิม)
+  if (xfUbN > 0 && xfUf) {
+    if (xfWrErr == 0 && xfUf.write(xfUb, xfUbN) == (size_t)xfUbN) xfWr += xfUbN;
+    else xfWrErr++;
+  }
+  xfUbN = 0;
+}
 
 static bool xfPathOk(const String &p) {
   if (p.length() == 0 || p[0] != '/') return false;
@@ -216,6 +229,8 @@ static void hUpload() {
   xfLastReq = millis();
   if (u.status == UPLOAD_FILE_START) {
     xfBusy = true; xfUpOk = false;
+    xfRx = xfWr = 0; xfWrErr = 0; xfUbN = 0; xfUpMsg = ""; xfUpErr[0] = 0;
+    xfDecl = (uint32_t)srv->arg("size").toInt();
     if (xfUf) xfUf.close();
     String dir = srv->arg("path");
     if (dir == "") dir = "/";
@@ -223,19 +238,46 @@ static void hUpload() {
     if (nm == "") nm = u.filename;
     nm = xfSafeName(nm);
     if (!xfPathOk(dir)) return;
-    xfUf = SD.open(xfJoin(dir, nm).c_str(), FILE_WRITE);
+    xfUpPath = xfJoin(dir, nm);
+    xfUf = SD.open(xfUpPath.c_str(), FILE_WRITE);
     if (xfUf) xfLastName = nm;
   } else if (u.status == UPLOAD_FILE_WRITE) {
-    if (xfUf && xfUf.write(u.buf, u.currentSize) != u.currentSize) xfUf.close();
+    xfRx += u.currentSize;
+    size_t off = 0;
+    while (off < u.currentSize) {
+      size_t room = sizeof(xfUb) - xfUbN, k = u.currentSize - off;
+      if (k > room) k = room;
+      memcpy(xfUb + xfUbN, u.buf + off, k);
+      xfUbN += k; off += k;
+      if (xfUbN == (int)sizeof(xfUb)) xfUbFlush();
+    }
   } else if (u.status == UPLOAD_FILE_END) {
-    if (xfUf) { xfUf.close(); xfUpOk = true; xfUp++; }
+    xfUbFlush();
+    bool had = (bool)xfUf;
+    if (xfUf) xfUf.close();
+    bool good = had && xfWrErr == 0 && xfWr == xfRx && (xfDecl == 0 || xfRx == xfDecl);
+    if (good) { xfUpOk = true; xfUp++; xfUpMsg = ""; }
+    else {
+      if (had) SD.remove(xfUpPath.c_str());   // ไม่เก็บไฟล์ที่ไม่ครบ
+      snprintf(xfUpErr, sizeof(xfUpErr), "got %u wrote %u of %u bytes, sd errors %d%s",
+               (unsigned)xfRx, (unsigned)xfWr, (unsigned)xfDecl, xfWrErr, had ? "" : ", cannot open file");
+      char t[120];
+      snprintf(t, sizeof(t), "ไฟล์ไม่ครบ (ลบแล้ว): รับ %u เขียน %u จาก %u ไบต์ เขียน SD ผิด %d",
+               (unsigned)xfRx, (unsigned)xfWr, (unsigned)xfDecl, xfWrErr);
+      xfUpMsg = t;
+    }
     xfBusy = false; xfDirty = true; xfLast = millis();
   } else if (u.status == UPLOAD_FILE_ABORTED) {
     if (xfUf) xfUf.close();
-    xfBusy = false;
+    if (xfUpPath.length()) SD.remove(xfUpPath.c_str());
+    snprintf(xfUpErr, sizeof(xfUpErr), "aborted at %u of %u bytes", (unsigned)xfRx, (unsigned)xfDecl);
+    char t[120];
+    snprintf(t, sizeof(t), "อัปโหลดถูกตัดกลางทาง: รับ %u จาก %u ไบต์", (unsigned)xfRx, (unsigned)xfDecl);
+    xfUpMsg = t;
+    xfBusy = false; xfDirty = true; xfLast = millis();
   }
 }
-static void hUpDone() { srv->send(xfUpOk ? 200 : 500, "text/plain", xfUpOk ? "ok" : "fail"); }
+static void hUpDone() { srv->send(xfUpOk ? 200 : 500, "text/plain", xfUpOk ? "ok" : (xfUpErr[0] ? xfUpErr : "fail")); }
 static void hRen() {
   xfLastReq = millis();
   String p = srv->arg("path");
@@ -288,6 +330,7 @@ static void xfDraw(bool ap, const String &ssid, const String &pass, const String
   snprintf(st, sizeof(st), "อัปโหลด %d  ดาวน์โหลด %d  อื่น ๆ %d", xfUp, xfDl, xfOps);
   thWrapDraw(16, 450, st, 1, 448, 1);
   if (xfLastName.length()) thWrapDraw(16, 500, xfLastName.c_str(), 1, 448, 2);
+  if (xfUpMsg.length()) thWrapDraw(16, 580, xfUpMsg.c_str(), 1, 448, 3);
   snprintf(st, sizeof(st), "RAM ว่าง %u KB", (unsigned)(ESP.getFreeHeap() / 1024));
   thWrapDraw(16, 720, st, 1, 448, 1);
   footer("BACK = หยุดและปิด WiFi");

@@ -17,8 +17,10 @@ static char rstInfo[120] = "";
 #define REFRESH_HOLD_MS 1200
 #include <Adafruit_GFX.h>
 #include "icons.h"
+#include "epub.h"
+#include "epub_text.h"
 
-#define VERSION "v0.6d " __DATE__ " " __TIME__
+#define VERSION "v0.8b " __DATE__ " " __TIME__
 #define EPD_SCK 8
 #define EPD_MISO 7
 #define EPD_MOSI 10
@@ -246,10 +248,34 @@ static int waitBtn() {
 }
 
 // ---------- UI helpers ----------
+// ---------- แบตเตอรี่ (GPIO0 ผ่านตัวหารแรงดัน 1/2) ----------
+static int batMv = 0, batPct = -1;
+static uint32_t batAt = 0;
+static void batUpdate() {
+  if (batAt && millis() - batAt < 60000) return;      // อ่านใหม่ไม่เกินนาทีละครั้ง
+  batAt = millis() ? millis() : 1;
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogReadMilliVolts(0);
+  int mv = (int)(sum / 8) * 2;
+  batMv = mv;
+  if (mv < 2600 || mv > 4600) { batPct = -1; return; }   // ค่าผิดปกติ: ไม่แสดง
+  double v = mv / 1000.0;
+  double y = -144.9390 * v * v * v + 1655.8629 * v * v - 6158.8520 * v + 7501.3202;   // เส้นโค้งลิเธียมไอออน
+  batPct = y < 0 ? 0 : (y > 100 ? 100 : (int)(y + 0.5));
+}
+static void drawBattery(int baseline) {
+  batUpdate();
+  if (batPct < 0) return;
+  char b[8];
+  snprintf(b, sizeof(b), "%d%%", batPct);
+  cv->setTextColor(1);
+  thDraw(480 - 16 - thWidth(b, 1), baseline, b, 1);
+}
 static void header(const char *t) {
   cv->fillScreen(0);
   cv->setTextColor(1);
-  thWrapDraw(16, 64, t, 0, 448, 1);
+  thWrapDraw(16, 64, t, 0, 380, 1);
+  drawBattery(64);
   cv->fillRect(0, 90, 480, 4, 1);
 }
 static void footer(const char *t) {
@@ -378,6 +404,89 @@ static void fileScreen(const String &dir, const String &name) {
   present();
   waitBtn();
 }
+// ---------- ทดสอบอ่าน EPUB (zip + inflate) v0.7a ----------
+struct ZBuf { char *p; size_t cap, len; };
+static bool zBufSink(const uint8_t *d, size_t n, void *c) {
+  ZBuf *b = (ZBuf *)c;
+  size_t room = b->cap - 1 - b->len, k = n < room ? n : room;
+  memcpy(b->p + b->len, d, k); b->len += k; b->p[b->len] = 0;
+  return true;
+}
+static char epubXml[2048];
+static void epubProbe(const String &dir, const String &name) {
+  String full = (dir == "/" ? String("/") : dir + "/") + name;
+  char rootPath[128] = "", title[160] = "";
+  int r1 = -99, r2 = -99;
+  uint32_t n = 0, cd = 0, ms = 0, usz = 0;
+  DBG("ep-open");
+  File f = SD.open(full.c_str(), FILE_READ);
+  if (!f) { msg("EPUB", "เปิดไฟล์ไม่ได้"); return; }
+  bool zipOk = zipOpen(f, cd, n);
+  ZEnt e;
+  if (zipOk) {
+    DBG("ep-cont");
+    ZBuf zb = {epubXml, sizeof(epubXml), 0};
+    epubXml[0] = 0;
+    if (zipFind(f, cd, n, "META-INF/container.xml", e)) r1 = zipExtract(f, e, zBufSink, &zb);
+    char *q = strstr(epubXml, "full-path=\"");
+    if (q) {
+      q += 11;
+      char *qe = strchr(q, '"');
+      if (qe) {
+        size_t k = qe - q;
+        if (k >= sizeof(rootPath)) k = sizeof(rootPath) - 1;
+        memcpy(rootPath, q, k); rootPath[k] = 0;
+      }
+    }
+    if (rootPath[0]) {
+      DBG("ep-opf");
+      ZBuf ob = {epubXml, sizeof(epubXml), 0};
+      epubXml[0] = 0;
+      uint32_t t0 = millis();
+      ZEnt eo;
+      if (zipFind(f, cd, n, rootPath, eo)) { r2 = zipExtract(f, eo, zBufSink, &ob); usz = eo.usz; }
+      ms = millis() - t0;
+      char *t = strstr(epubXml, "<dc:title");
+      if (t && (t = strchr(t, '>'))) {
+        t++;
+        char *te = strchr(t, '<');
+        size_t k = te ? (size_t)(te - t) : strlen(t);
+        if (k >= sizeof(title)) k = sizeof(title) - 1;
+        memcpy(title, t, k); title[k] = 0;
+      }
+    }
+  }
+  f.close();   // อ่าน SD ให้จบก่อนแล้วค่อยวาดจอ
+  DBG("ep-draw");
+  header("EPUB");
+  cv->setTextColor(1);
+  int y = 140;
+  char ln[200];
+  thWrapDraw(16, y, name.c_str(), 1, 448, 2); y += 2 * thPitch(1) + 14;
+  if (!zipOk) {
+    thDraw(16, y, "ไม่ใช่ไฟล์ zip/epub", 0);
+  } else {
+    snprintf(ln, sizeof(ln), "รายการใน zip: %u", (unsigned)n);
+    thDraw(16, y, ln, 1); y += thPitch(1) + 14;
+    if (r1 == 0) snprintf(ln, sizeof(ln), "container.xml: ผ่าน (CRC ตรง)");
+    else snprintf(ln, sizeof(ln), "container.xml: ล้มเหลว รหัส %d", r1);
+    thDraw(16, y, ln, 1); y += thPitch(1) + 14;
+    if (rootPath[0]) { thWrapDraw(16, y, rootPath, 1, 448, 2); y += 2 * thPitch(1) + 14; }
+    if (r2 == 0) snprintf(ln, sizeof(ln), "OPF: %u ไบต์ %u ms ผ่าน (CRC ตรง)", (unsigned)usz, (unsigned)ms);
+    else snprintf(ln, sizeof(ln), "OPF: ล้มเหลว รหัส %d", r2);
+    thDraw(16, y, ln, 1); y += thPitch(1) + 14;
+    if (title[0]) {
+      thDraw(16, y, "ชื่อเรื่อง:", 1); y += thPitch(1) + 6;
+      thWrapDraw(16, y, title, 0, 448, 3);
+    }
+  }
+  footer("กดปุ่มใดก็ได้");
+  present();
+  waitBtn();
+}
+#include "thai_dict.h"
+#include "thai_wb.h"
+#include "epub_read.h"
 static void library() {
   SD.end();
   if (!SD.begin(SD_CS, SPI, 20000000)) { msg("ห้องสมุด", "อ่าน SD การ์ดไม่ได้"); return; }
@@ -411,7 +520,14 @@ static void library() {
       sel = 0;
     } else {
       sel = s;
-      fileScreen(cwd, libNames[s]);
+      {
+        String ln = libNames[s]; ln.toLowerCase();
+        if (ln.endsWith(".epub")) {
+          String fp = (cwd == "/" ? String("/") : cwd + "/") + libNames[s];
+          epubReadPath(fp.c_str(), libNames[s].c_str());
+        }
+        else fileScreen(cwd, libNames[s]);
+      }
     }
   }
 }
@@ -422,12 +538,13 @@ static void library() {
 #define TILE 96
 #define TILE_Y 668
 static const uint8_t *const ICONS[N_ICONS] = {ICON_LIBRARY, ICON_APPS, ICON_UPDATE, ICON_SETTING};
-static const char *const LABELS[N_ICONS] = {"ห้องสมุด", "แอป", "อัปเดต", "ตั้งค่า"};
+static const char *const LABELS[N_ICONS] = {"ห้องสมุด", "เพิ่มเติม", "อัปเดต", "ตั้งค่า"};
 
 static void drawHome(int sel) {
   cv->fillScreen(0);
   cv->setTextColor(1);
   thDraw(24, 76, "X4 Reader", 0);
+  drawBattery(76);
   cv->fillRect(0, 100, 480, 4, 1);
   cv->setTextSize(1);
   cv->setCursor(24, 114);
@@ -509,6 +626,8 @@ static void buttonTest() {
     cv->setCursor(16, 130); cv->print(b < 0 ? "-" : names[b]);
     cv->setCursor(16, 230); cv->print("ADC1: "); cv->print(a1);
     cv->setCursor(16, 280); cv->print("ADC2: "); cv->print(a2);
+    batAt = 0; batUpdate();
+    cv->setCursor(16, 330); cv->print("BAT mV: "); cv->print(batMv);
     footer("POWER = ออก");
     present();
     while ((b = readBtn()) == NONE) { idleTick(); delay(10); }
@@ -548,7 +667,7 @@ static void fontTest() {
 #include "wifi_xfer.h"
 static void appsMenu() {
   String items[4] = {"รับส่งไฟล์ WiFi", "ทดสอบคีย์บอร์ด", "Button test", "ทดสอบฟอนต์"};
-  int s = menu("แอป", items, 4, 3, "OK=เปิด  BACK=กลับ");
+  int s = menu("เพิ่มเติม", items, 4, 3, "OK=เปิด  BACK=กลับ");
   if (s == 0) wifiMenu();
   else if (s == 1) kbTest();
   else if (s == 2) buttonTest();
